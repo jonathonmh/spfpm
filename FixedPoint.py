@@ -96,23 +96,94 @@ class FXfamily(object):
     can be manipulated concurrently.
     """
 
-    def __init__(self, n_bits=64, n_intbits=None):
+    def __init__(self, n_bits=64, n_intbits=None, n_startintbits=0, overflow_mode=None, rounding_mode=None):
         self.fraction_bits = n_bits         # Bits to right of binary point
         self.integer_bits = n_intbits       # Bits to left of binary point (including sign)
         self.scale = 1 << n_bits
         self._roundup = 1 << (n_bits - 1)
+        # Number of bits required to hold the current scaledval
+        # Note: if overflow_mode is not set to "expand_int_bits"
+        #       this has no effect
+        self.required_integer_bits = n_startintbits
+
+        self.overflow_mode = overflow_mode
+        self.rounding_mode = rounding_mode
+
+        # TODO add option to permit int and frac bits to change when mixing families.
+        self.allow_int_frac_change = None
+
+        # Added by J Harvey 3/10/18
+        # optional overflow modes:
+        # ="wrap" -> when addition or multiplication exceeds the integer bits, the FixedNum
+        #            wraps around modulo "2^N"
+        #            Only applies when n_intbits is non-zero.
+        # ="expand_int_bits" -> as the integer bits are exceeded, the integer_bits field is changed by +/-1
+        #                    
+        # rounding mode: behaviour to apply when losing fractional precision 
+        # =None: default - truncate, which is fastest
+        # =round  (TODO)     rounds towards the nearest fractional value, of the new LSB.
+
+        # helper function
+        def record_int_growth(scaledval):
+            if overflow_mode == "expand_int_bits":
+                intDigits = 1
+                intPart = scaledval >> n_bits
+
+                if intPart >= 0:
+                    while intPart >= (1 << (intDigits)):
+                        intDigits += 1
+                else:
+                    while (1 << (intDigits - 1)) + intPart < 0:
+                        intDigits += 1
+
+                # Max hold (so that integer word growth can be determined)
+                if self.required_integer_bits < intDigits:
+                    self.required_integer_bits = intDigits
 
         try:
             thresh = 1 << (n_bits + n_intbits - 1)
             def validate(scaledval):
                 if scaledval >= thresh or scaledval < -thresh:
-                    raise FXoverflowError
+                    if overflow_mode is None:
+                        raise FXoverflowError
+
+                    elif overflow_mode == "wrap":
+                        # Produce wrap-around behaviour according to the threshold
+                        md = scaledval // thresh  
+
+                        if md % 2 == 0:
+                            newscaledval = scaledval - md * thresh
+                        else:
+                            newscaledval = -thresh + scaledval % thresh                  
+                        
+                        return newscaledval
+
+                    elif overflow_mode == "expand_int_bits":
+                        record_int_growth (scaledval)
+                        
+                    elif overflow_mode == "saturate":
+                        # TODO
+                        pass
+                    
+                else:
+                    if not overflow_mode is None:
+                        return scaledval
         except:
-            def validate(scaledval): return
+            def validate(scaledval): 
+                if overflow_mode == "expand_int_bits":
+                    record_int_growth (scaledval)
+
+                return
         self.validate = validate
 
         # Cached values of various mathematical constants:
         self._exp1, self._log2, self._pi, self._sqrt2 = (None,) * 4
+
+    # Added 3/10/18 by J Harvey
+    @property
+    def current_integer_bits(self):
+        """The number of integer binary digits"""
+        return self.integer_bits
 
     @property
     def resolution(self):
@@ -236,7 +307,13 @@ class FXfamily(object):
             return new_val
         else:
             # Safest approach is to truncate bits, rather than rounding:
-            return (other_val >> -bit_inc)
+            if self.rounding_mode is None:
+                return (other_val >> -bit_inc)
+
+            # However, if rounding mode is enabled
+            #else:
+                # TODO: rounding
+            #    pass
 
     def augment(self, opcount=None):
         """Construct new FXfamily with enhanced resolution.
@@ -302,6 +379,15 @@ class FXnum(object):
     def _rawbuild(cls, fam, sv):
         """Shortcut for creating new FXnum instance, for internal use only."""
         num = object.__new__(cls)
+        
+        if fam.overflow_mode is None:
+            fam.validate(sv)
+        elif fam.overflow_mode == "wrap":
+            sv = fam.validate(sv)  
+        elif fam.overflow_mode == "expand_int_bits":
+            fam.validate(sv)
+        #elif fam.overflow_mode == "saturate": TODO       
+
         fam.validate(sv)
         num.family = fam
         num.scaledval = sv
@@ -331,8 +417,19 @@ class FXnum(object):
         """Turn number into FXnum or check that it is in same family"""
         try:
             # Binary operations must involve members of same family
-            if self.family != other.family:
-                raise FXfamilyError(1)
+            if self.family.allow_int_frac_change is None:
+                if self.family != other.family:
+                    raise FXfamilyError(1)
+            else:
+                if self.family.allow_int_frac_change == "both":
+                    # TODO allow expansion of both integer and fractional bits
+                    pass
+                elif self.family.allow_int_frac_change == "int_only":
+                    # TODO allow expansion of only integer bits
+                    pass
+                elif self.family.allow_int_frac_change == "frac_only":
+                    # TODO allow expansion of only fractional bits
+                    pass
         except AttributeError:
             # Automatic casting from types other than FXnum is allowed:
             other = FXnum(other, self.family)
@@ -489,6 +586,32 @@ class FXnum(object):
                 idx += 1
         return rep
 
+    # Added J Harvey
+    def fromBinaryString(self, s, logBase=1):
+        """Convert number from string in base 2/4/8/16"""
+
+        if not isinstance(logBase, int) or logBase > 4 or logBase < 1:
+            raise ValueError('Cannot convert to base greater than 16')
+
+        # Assume separator is a "." - find its location in the passed in string
+        pos = s.index('.')       # will raise ValueError if no '.' found
+
+        # FIXME: assumes just binary strings at this point
+        bits = len(s)
+        n_int_bits = pos - 1
+        n_bits = bits - pos - 1
+
+        if self.family.fraction_bits != n_bits or self.family.integer_bits != n_int_bits:
+            if not self.family.integer_bits is None:
+                raise ValueError("Tried to convert %s with %d frac bits and %d int bits to %s" % (s, n_bits, n_int_bits, self.family))
+
+            # TODO: need to account for the other case (of integer_bits not None) here
+
+        from bitstring import BitArray, BitStream
+        bs = BitArray("0b"+s.replace(".",""))
+
+        self.scaledval = bs.int
+
     def toBinaryString(self, logBase=1, twosComp=True):
         """Convert number into string in base 2/4/8/16
 
@@ -521,6 +644,26 @@ class FXnum(object):
 
         return prefix + digits[:-fracDigits] + '.' + digits[-fracDigits:]
 
+    # Added J Harvey
+    # Return the approximate number of integer digits required to represent
+    # this number. 
+    # This code moved from _toTwosComplement
+    def _requiredIntBits(self, useActual=True, logBase=1):
+        """ TODO: note on the need to extract this from _toTwosComplement"""
+        if self.family.integer_bits is not None and useActual:
+            intDigits = (self.family.integer_bits + logBase - 1) // logBase
+        else:
+            intDigits = 1
+            intPart = self.scaledval >> self.family.resolution
+            if intPart >= 0:
+                while intPart >= (1 << (intDigits * logBase)):
+                    intDigits += 1
+            else:
+                while (1 << (intDigits * logBase - 1)) + intPart < 0:
+                    intDigits += 1
+        
+        return intDigits
+
     def _toTwosComplement(self, logBase=1):
         """Convert binary representation to twos-complement for printing.
 
@@ -533,18 +676,8 @@ class FXnum(object):
         fracDigits = (self.family.resolution + logBase - 1) // logBase
         bitPattern = self.scaledval
 
-        if self.family.integer_bits is not None:
-            intDigits = (self.family.integer_bits + logBase - 1) // logBase
-        else:
-            intDigits = 1
-            intPart = self.scaledval >> self.family.resolution
-            if intPart >= 0:
-                while intPart >= (1 << (intDigits * logBase)):
-                    intDigits += 1
-            else:
-                while (1 << (intDigits * logBase - 1)) + intPart < 0:
-                    intDigits += 1
-
+        intDigits = self._requiredIntBits(logBase)
+        
         if bitPattern < 0:
             bitPattern += 1 << (intDigits * logBase + self.family.resolution)
 
